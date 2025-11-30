@@ -57,7 +57,6 @@ class OptimizedP2POrderSnatcher {
         });
 
         this.ws.on("message", (data) => {
-            console.log(data);
             this.processWebSocketMessage(data.toString());
         });
 
