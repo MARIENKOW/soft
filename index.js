@@ -254,6 +254,8 @@ class OptimizedP2POrderSnatcher {
                 }
             } else if (response.status === 400) {
                 this.stats.failed++;
+
+                console.log(response);
                 console.log("❌ Уже занят или ошибка");
             } else {
                 this.stats.failed++;
