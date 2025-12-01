@@ -1,9 +1,6 @@
 require("dotenv").config();
 const WebSocket = require("ws");
 const axios = require("axios");
-const { performance } = require("perf_hooks");
-
-let startTime = 0;
 
 const CONFIG = {
     ACCESS_TOKEN: process.env.ACCESS_TOKEN || "",
@@ -60,7 +57,6 @@ class OptimizedP2POrderSnatcher {
         });
 
         this.ws.on("message", (data) => {
-            startTime = performance.now();
             this.processWebSocketMessage(data.toString());
         });
 
@@ -208,9 +204,9 @@ class OptimizedP2POrderSnatcher {
 
     async takeOrder(orderId) {
         try {
-            let response = axios.post(
+            let response = await axios.post(
                 `https://app.cr.bot/internal/v1/p2c/payments/take/${orderId}`,
-                null, // Empty body - это важно!
+                null,
                 {
                     headers: {
                         Cookie: `access_token=${this.config.ACCESS_TOKEN}`,
@@ -228,8 +224,6 @@ class OptimizedP2POrderSnatcher {
                 }
             );
 
-            console.log(performance.now() - startTime);
-            response = await response;
             if (response.status === 200) {
                 this.stats.taken++;
                 console.log("✅ ЗАКАЗ ВЗЯТ УСПЕШНО!");
