@@ -232,7 +232,6 @@ class OptimizedP2POrderSnatcher {
                 `https://app.cr.bot/internal/v1/p2c/payments/take/${orderId}`,
                 {
                     method: "POST",
-                    body: null,
                     headers: {
                         Cookie: `access_token=${this.config.ACCESS_TOKEN}`,
                         "User-Agent":
@@ -240,9 +239,24 @@ class OptimizedP2POrderSnatcher {
                         Origin: "https://app.cr.bot",
                         Referer: "https://app.cr.bot/p2c",
                         Accept: "application/json, text/plain, */*",
+                        "Accept-Language":
+                            "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                         "Content-Type": "application/json",
+                        // Добавляем все оригинальные заголовки
+                        "Accept-Encoding": "gzip, deflate, br",
+                        Connection: "keep-alive",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
                     },
+                    body: null, // Empty body - это важно! Сохраняем как в оригинале
                     signal: controller.signal,
+                    // Дополнительные параметры для точного соответствия
+                    redirect: "follow",
+                    credentials: "include", // Важно для cookies
+                    mode: "cors",
+                    cache: "no-cache",
+                    referrerPolicy: "strict-origin-when-cross-origin",
                 }
             );
 
@@ -251,39 +265,70 @@ class OptimizedP2POrderSnatcher {
             this.stats.avgProcessTime =
                 this.stats.avgProcessTime * 0.7 + processTime * 0.3;
 
+            // Получаем текст ответа для обработки
+            const responseText = await response.text();
+
             if (response.status === 200) {
                 this.stats.taken++;
-                console.log(`✅ ЗАКАЗ ВЗЯТ! (${Math.round(processTime)}ms)`);
+                console.log(
+                    `✅ ЗАКАЗ ВЗЯТ УСПЕШНО! (${Math.round(processTime)}ms)`
+                );
 
                 try {
-                    const data = await response.json();
-                    if (data.data) {
-                        const paymentLink = `https://app.cr.bot/p2c/orders/${data.data.id}?back=payments`;
-                        console.log(`🔗 Оплата: ${paymentLink}`);
-
-                        // Автоматическое открытие ссылки в браузере (опционально)
-                        // const { exec } = require('child_process');
-                        // exec(`start ${paymentLink}`); // для Windows
+                    // Парсим JSON только если ответ не пустой
+                    if (responseText.trim()) {
+                        const responseData = JSON.parse(responseText);
+                        if (responseData.data) {
+                            const orderData = responseData.data;
+                            const paymentLink = `https://app.cr.bot/p2c/orders/${orderData.id}?back=payments`;
+                            console.log("Ссылка для оплаты - ", paymentLink);
+                        }
                     }
-                } catch (e) {
-                    // Игнорируем ошибки парсинга ответа
+                } catch (parseError) {
+                    console.log(
+                        "⚠️ Ответ получен, но не удалось распарсить JSON"
+                    );
                 }
-            } else if (response.status === 400) {
-                this.stats.failed++;
-
-                console.log(response);
-                console.log("❌ Уже занят или ошибка");
             } else {
                 this.stats.failed++;
-                console.log(`❌ Ошибка ${response.status}`);
+
+                try {
+                    // Пытаемся получить текст ошибки
+                    if (responseText.trim()) {
+                        const errorData = JSON.parse(responseText);
+                        console.log(
+                            errorData.error === "ActiveOrderExists"
+                                ? "❌ Нужно оплатить старый заказ."
+                                : `❌ Не успели взять: ${
+                                      errorData.error || "Неизвестная ошибка"
+                                  }`
+                        );
+                    } else {
+                        console.log(
+                            `❌ Не успели взять (статус: ${response.status})`
+                        );
+                    }
+                } catch (e) {
+                    console.log(
+                        `❌ Ошибка при обработке ответа (статус: ${response.status})`
+                    );
+                }
             }
         } catch (error) {
             if (error.name === "AbortError") {
                 this.stats.timeouts++;
-                console.log("⏰ Таймаут запроса");
+                console.log("⏰ Таймаут...");
+            } else if (
+                error.name === "TypeError" &&
+                error.message.includes("fetch")
+            ) {
+                this.stats.failed++;
+                console.log("❌ Ошибка сети");
             } else {
                 this.stats.failed++;
+                console.log("❌ Ошибка:", error.message);
             }
+            return false;
         } finally {
             clearTimeout(timeout);
         }
