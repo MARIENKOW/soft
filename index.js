@@ -12,6 +12,8 @@ const CONFIG = {
     CONCURRENT_REQUESTS: 3, // Количество параллельных запросов
 };
 
+let startTime = 0
+
 class OptimizedP2POrderSnatcher {
     constructor(config) {
         this.config = config;
@@ -72,6 +74,7 @@ class OptimizedP2POrderSnatcher {
         });
 
         this.ws.on("message", (data) => {
+            startTime = performance.now()
             this.processWebSocketMessage(data.toString());
         });
 
@@ -226,9 +229,8 @@ class OptimizedP2POrderSnatcher {
         );
 
         try {
-            const startTime = performance.now();
 
-            const response = await fetch(
+            let response = fetch(
                 `https://app.cr.bot/internal/v1/p2c/payments/take/${orderId}`,
                 {
                     method: "POST",
@@ -262,7 +264,7 @@ class OptimizedP2POrderSnatcher {
 
             const processTime = performance.now() - startTime;
             console.log("время запроса: ", processTime);
-            console.log(response);
+            response = await response;
             this.stats.avgProcessTime =
                 this.stats.avgProcessTime * 0.7 + processTime * 0.3;
 
