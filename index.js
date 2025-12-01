@@ -32,15 +32,19 @@ class OptimizedP2POrderSnatcher {
             avgProcessTime: 0,
             lastProcessTime: 0,
         };
-        
+
         this.startTime = performance.now();
         this.cleanupInterval = null;
     }
 
     async start() {
         console.log("🚀 Запуск гипер-оптимизированного бота...");
-        console.log(`🎯 Диапазон суммы: ${this.config.MIN_AMOUNT} - ${this.config.MAX_AMOUNT} RUB`);
-        console.log(`⚡ Параллельных запросов: ${this.config.CONCURRENT_REQUESTS}`);
+        console.log(
+            `🎯 Диапазон суммы: ${this.config.MIN_AMOUNT} - ${this.config.MAX_AMOUNT} RUB`
+        );
+        console.log(
+            `⚡ Параллельных запросов: ${this.config.CONCURRENT_REQUESTS}`
+        );
 
         await this.connectWebSocket();
         this.isRunning = true;
@@ -122,22 +126,22 @@ class OptimizedP2POrderSnatcher {
 
     handleListUpdateOptimized(message) {
         const startTime = performance.now();
-        
+
         try {
             // Быстрый поиск данных ордера
             const dataIndex = message.indexOf('"data":');
             if (dataIndex === -1) return;
 
             // Находим начало JSON объекта ордера
-            const start = message.indexOf('{', dataIndex);
+            const start = message.indexOf("{", dataIndex);
             if (start === -1) return;
 
             let braceCount = 0;
             let end = -1;
 
             for (let i = start; i < message.length; i++) {
-                if (message[i] === '{') braceCount++;
-                if (message[i] === '}') {
+                if (message[i] === "{") braceCount++;
+                if (message[i] === "}") {
                     braceCount--;
                     if (braceCount === 0) {
                         end = i + 1;
@@ -161,7 +165,7 @@ class OptimizedP2POrderSnatcher {
         } catch (error) {
             // Пропускаем ошибки
         }
-        
+
         this.stats.lastProcessTime = performance.now() - startTime;
     }
 
@@ -174,14 +178,16 @@ class OptimizedP2POrderSnatcher {
 
         // Быстрая валидация без лишних проверок
         const amount = Math.trunc(order.in_amount);
-        if (amount < this.config.MIN_AMOUNT || 
-            amount > this.config.MAX_AMOUNT || 
-            order.in_asset !== "RUB") {
+        if (
+            amount < this.config.MIN_AMOUNT ||
+            amount > this.config.MAX_AMOUNT ||
+            order.in_asset !== "RUB"
+        ) {
             return;
         }
 
         this.stats.filtered++;
-        
+
         // console.log(`⚡ ЗАКАЗ ${amount} RUB`); // Минимальный лог для скорости
 
         if (this.config.TAKE_ORDERS) {
@@ -196,10 +202,13 @@ class OptimizedP2POrderSnatcher {
 
     async processQueue() {
         // Ограничиваем количество параллельных запросов
-        while (this.activeRequests < this.config.CONCURRENT_REQUESTS && this.requestQueue.length > 0) {
+        while (
+            this.activeRequests < this.config.CONCURRENT_REQUESTS &&
+            this.requestQueue.length > 0
+        ) {
             const orderId = this.requestQueue.shift();
             this.activeRequests++;
-            
+
             // Запускаем асинхронно без await чтобы не блокировать
             this.takeOrderFast(orderId).finally(() => {
                 this.activeRequests--;
@@ -211,29 +220,36 @@ class OptimizedP2POrderSnatcher {
 
     async takeOrderFast(orderId) {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), this.config.REQUEST_TIMEOUT);
+        const timeout = setTimeout(
+            () => controller.abort(),
+            this.config.REQUEST_TIMEOUT
+        );
 
         try {
             const startTime = performance.now();
-            
+
             const response = await fetch(
                 `https://app.cr.bot/internal/v1/p2c/payments/take/${orderId}`,
                 {
-                    method: 'POST',
+                    method: "POST",
+                    body: null,
                     headers: {
-                        'Cookie': `access_token=${this.config.ACCESS_TOKEN}`,
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'Origin': 'https://app.cr.bot',
-                        'Referer': 'https://app.cr.bot/p2c',
-                        'Accept': 'application/json, text/plain, */*',
-                        'Content-Type': 'application/json',
+                        Cookie: `access_token=${this.config.ACCESS_TOKEN}`,
+                        "User-Agent":
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        Origin: "https://app.cr.bot",
+                        Referer: "https://app.cr.bot/p2c",
+                        Accept: "application/json, text/plain, */*",
+                        "Content-Type": "application/json",
                     },
                     signal: controller.signal,
                 }
             );
 
             const processTime = performance.now() - startTime;
-            this.stats.avgProcessTime = (this.stats.avgProcessTime * 0.7 + processTime * 0.3);
+            console.log("время запроса: ", processTime);
+            this.stats.avgProcessTime =
+                this.stats.avgProcessTime * 0.7 + processTime * 0.3;
 
             if (response.status === 200) {
                 this.stats.taken++;
@@ -244,7 +260,7 @@ class OptimizedP2POrderSnatcher {
                     if (data.data) {
                         const paymentLink = `https://app.cr.bot/p2c/orders/${data.data.id}?back=payments`;
                         console.log(`🔗 Оплата: ${paymentLink}`);
-                        
+
                         // Автоматическое открытие ссылки в браузере (опционально)
                         // const { exec } = require('child_process');
                         // exec(`start ${paymentLink}`); // для Windows
@@ -262,7 +278,7 @@ class OptimizedP2POrderSnatcher {
                 console.log(`❌ Ошибка ${response.status}`);
             }
         } catch (error) {
-            if (error.name === 'AbortError') {
+            if (error.name === "AbortError") {
                 this.stats.timeouts++;
                 console.log("⏰ Таймаут запроса");
             } else {
@@ -284,7 +300,7 @@ class OptimizedP2POrderSnatcher {
                     this.orderCache.delete(id);
                 }
             }
-            
+
             // Очищаем очередь если она слишком большая
             if (this.requestQueue.length > 100) {
                 this.requestQueue = this.requestQueue.slice(-50);
@@ -294,13 +310,18 @@ class OptimizedP2POrderSnatcher {
 
     startMonitoring() {
         setInterval(() => {
-            const uptime = ((performance.now() - this.startTime) / 1000).toFixed(0);
+            const uptime = (
+                (performance.now() - this.startTime) /
+                1000
+            ).toFixed(0);
             console.log(
                 `📈 СТАТИСТИКА за ${uptime}с:\n` +
-                `   Всего: ${this.stats.total} | Подходят: ${this.stats.filtered}\n` +
-                `   Взято: ${this.stats.taken} | Не взято: ${this.stats.failed}\n` +
-                `   В очереди: ${this.requestQueue.length} | Активных: ${this.activeRequests}\n` +
-                `   Среднее время: ${this.stats.avgProcessTime.toFixed(1)}ms`
+                    `   Всего: ${this.stats.total} | Подходят: ${this.stats.filtered}\n` +
+                    `   Взято: ${this.stats.taken} | Не взято: ${this.stats.failed}\n` +
+                    `   В очереди: ${this.requestQueue.length} | Активных: ${this.activeRequests}\n` +
+                    `   Среднее время: ${this.stats.avgProcessTime.toFixed(
+                        1
+                    )}ms`
             );
         }, 10000);
     }
