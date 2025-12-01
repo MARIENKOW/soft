@@ -3,6 +3,8 @@ const WebSocket = require("ws");
 const axios = require("axios");
 const { performance } = require("perf_hooks");
 
+let startTime = 0;
+
 const CONFIG = {
     ACCESS_TOKEN: process.env.ACCESS_TOKEN || "",
     MIN_AMOUNT: parseInt(process.env.MIN_AMOUNT) || 500,
@@ -58,7 +60,7 @@ class OptimizedP2POrderSnatcher {
         });
 
         this.ws.on("message", (data) => {
-            // console.log(data);
+            startTime = performance.now();
             this.processWebSocketMessage(data.toString());
         });
 
@@ -206,8 +208,7 @@ class OptimizedP2POrderSnatcher {
 
     async takeOrder(orderId) {
         try {
-            const startTime = performance.now();
-            const response = await axios.post(
+            let response = axios.post(
                 `https://app.cr.bot/internal/v1/p2c/payments/take/${orderId}`,
                 null, // Empty body - это важно!
                 {
@@ -227,9 +228,8 @@ class OptimizedP2POrderSnatcher {
                 }
             );
 
-            console.log(response);
             console.log(performance.now() - startTime);
-
+            response = await response;
             if (response.status === 200) {
                 this.stats.taken++;
                 console.log("✅ ЗАКАЗ ВЗЯТ УСПЕШНО!");
