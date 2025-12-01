@@ -205,6 +205,7 @@ class OptimizedP2POrderSnatcher {
 
     async takeOrder(orderId) {
         try {
+            const startTime = performance.now();
             const response = await axios.post(
                 `https://app.cr.bot/internal/v1/p2c/payments/take/${orderId}`,
                 null, // Empty body - это важно!
