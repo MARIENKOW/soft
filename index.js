@@ -262,6 +262,7 @@ class OptimizedP2POrderSnatcher {
 
             const processTime = performance.now() - startTime;
             console.log("время запроса: ", processTime);
+            console.log(response);
             this.stats.avgProcessTime =
                 this.stats.avgProcessTime * 0.7 + processTime * 0.3;
 
