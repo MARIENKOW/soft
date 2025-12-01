@@ -1,6 +1,7 @@
 require("dotenv").config();
 const WebSocket = require("ws");
 const axios = require("axios");
+const { performance } = require("perf_hooks");
 
 const CONFIG = {
     ACCESS_TOKEN: process.env.ACCESS_TOKEN || "",
@@ -225,6 +226,9 @@ class OptimizedP2POrderSnatcher {
                     validateStatus: null,
                 }
             );
+
+            console.log(response);
+            console.log(performance.now() - startTime);
 
             if (response.status === 200) {
                 this.stats.taken++;
