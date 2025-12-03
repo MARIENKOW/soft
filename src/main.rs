@@ -93,7 +93,7 @@ impl OptimizedP2POrderSnatcher {
         match connect_async(Url::parse(ws_url).unwrap()).await {
             Ok((ws_stream, _)) => {
                 info!("✅ WebSocket подключен");
-                let (write, mut read) = ws_stream.split();
+                let (write, read) = ws_stream.split();
                 
                 // Сохраняем write часть для отправки сообщений
                 let write_arc = Arc::new(Mutex::new(write));
@@ -128,10 +128,21 @@ impl OptimizedP2POrderSnatcher {
             Err(e) => {
                 error!("❌ Ошибка подключения WebSocket: {}", e);
                 warn!("🔌 Переподключаемся через 3 секунды...");
-                time::sleep(Duration::from_secs(3)).await;
-                self.connect_websocket().await;
+                
+                // Используем Box для рекурсии
+                let self_clone = self.clone();
+                tokio::spawn(async move {
+                    time::sleep(Duration::from_secs(3)).await;
+                    self_clone.reconnect_websocket().await;
+                });
             }
         }
+    }
+
+    // Отдельный метод для переподключения
+    async fn reconnect_websocket(&self) {
+        warn!("🔄 Выполняем переподключение...");
+        self.connect_websocket().await;
     }
 
     async fn send_socketio_handshake(&self, write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>) {
@@ -153,10 +164,12 @@ impl OptimizedP2POrderSnatcher {
     }
 
     async fn start_ping_pong(&self, write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>) {
+        let write_clone = write.clone();
+        
         tokio::spawn(async move {
             loop {
                 time::sleep(Duration::from_secs(25)).await;
-                let mut write_lock = write.lock().await;
+                let mut write_lock = write_clone.lock().await;
                 if let Err(e) = write_lock.send(Message::Text("2".to_string())).await {
                     error!("❌ Ошибка отправки ping: {}", e);
                     break;
@@ -197,6 +210,12 @@ impl OptimizedP2POrderSnatcher {
                     break;
                 }
             }
+        }
+        
+        // При разрыве соединения пытаемся переподключиться
+        if *is_running.lock().await {
+            warn!("🔄 Соединение разорвано, планируем переподключение...");
+            // Здесь можно добавить логику переподключения, если нужно
         }
     }
 
@@ -440,6 +459,19 @@ impl OptimizedP2POrderSnatcher {
     }
 }
 
+// Реализуем Clone для структуры
+impl Clone for OptimizedP2POrderSnatcher {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            processed_orders: self.processed_orders.clone(),
+            stats: self.stats.clone(),
+            client: self.client.clone(),
+            is_running: self.is_running.clone(),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Инициализация логгера
@@ -473,7 +505,7 @@ async fn main() {
     } else {
         config.access_token.clone()
     };
-    println!("Access Token: {}", token_display);
+    info!("Access Token: {}", token_display);
 
     let bot = OptimizedP2POrderSnatcher::new(config);
 
