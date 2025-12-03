@@ -10,6 +10,8 @@ const CONFIG = {
     REQUEST_TIMEOUT: parseInt(process.env.REQUEST_TIMEOUT) || 15000,
 };
 
+console.log(process.env.ACCESS_TOKEN);
+
 class OptimizedP2POrderSnatcher {
     constructor(config) {
         this.config = config;
