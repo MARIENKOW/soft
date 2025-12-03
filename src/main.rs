@@ -10,9 +10,12 @@ use serde::{Deserialize, Serialize};
 use dotenv::dotenv;
 use reqwest::Client;
 use std::process;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{connect_async, WebSocketStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{info, error, warn};
+use futures_util::stream::SplitSink;
+use tokio::net::TcpStream;
+use tokio_tungstenite::MaybeTlsStream;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -87,68 +90,119 @@ impl OptimizedP2POrderSnatcher {
         
         info!("🔌 Подключаемся к WebSocket...");
 
-        let (mut ws_stream, _) = connect_async(Url::parse(ws_url).unwrap())
-            .await
-            .expect("Failed to connect");
+        match connect_async(Url::parse(ws_url).unwrap()).await {
+            Ok((ws_stream, _)) => {
+                info!("✅ WebSocket подключен");
+                let (write, mut read) = ws_stream.split();
+                
+                // Сохраняем write часть для отправки сообщений
+                let write_arc = Arc::new(Mutex::new(write));
+                
+                // Отправка handshake
+                self.send_socketio_handshake(write_arc.clone()).await;
 
-        // Установка заголовков через дополнительное соединение
-        info!("✅ WebSocket подключен");
-        self.send_socketio_handshake(&mut ws_stream).await;
+                // Клонируем необходимые данные для обработчика сообщений
+                let processed_orders_clone = self.processed_orders.clone();
+                let stats_clone = self.stats.clone();
+                let config_clone = self.config.clone();
+                let client_clone = self.client.clone();
+                let is_running_clone = self.is_running.clone();
+                let write_clone = write_arc.clone();
 
-        let processed_orders_clone = self.processed_orders.clone();
-        let stats_clone = self.stats.clone();
-        let config_clone = self.config.clone();
-        let client_clone = self.client.clone();
-        let is_running_clone = self.is_running.clone();
+                // Запускаем обработчик входящих сообщений
+                tokio::spawn(async move {
+                    Self::handle_websocket_messages(
+                        read,
+                        write_clone,
+                        processed_orders_clone,
+                        stats_clone,
+                        config_clone,
+                        client_clone,
+                        is_running_clone,
+                    ).await;
+                });
 
-        // Обработка входящих сообщений
-        tokio::spawn(async move {
-            while *is_running_clone.lock().await {
-                match ws_stream.next().await {
-                    Some(Ok(message)) => {
-                        let start_time = Instant::now();
-                        Self::process_websocket_message(
-                            message,
-                            &processed_orders_clone,
-                            &stats_clone,
-                            &config_clone,
-                            &client_clone,
-                            start_time,
-                        ).await;
-                    }
-                    Some(Err(e)) => {
-                        error!("❌ WebSocket ошибка: {}", e);
-                        break;
-                    }
-                    None => break,
-                }
+                // Запускаем ping-pong
+                self.start_ping_pong(write_arc.clone()).await;
             }
-            
-            // Переподключение
-            warn!("🔌 WebSocket отключен, переподключаемся через 3 секунды...");
-            time::sleep(Duration::from_secs(3)).await;
-        });
+            Err(e) => {
+                error!("❌ Ошибка подключения WebSocket: {}", e);
+                warn!("🔌 Переподключаемся через 3 секунды...");
+                time::sleep(Duration::from_secs(3)).await;
+                self.connect_websocket().await;
+            }
+        }
     }
 
-    async fn send_socketio_handshake(&self, ws_stream: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-        Message,
-    >) {
+    async fn send_socketio_handshake(&self, write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>) {
         let handshake_sequence = vec![
-            (Duration::from_millis(10), "0"),
-            (Duration::from_millis(50), "40"),
-            (Duration::from_millis(100), r#"42["list:initialize"]"#),
+            (Duration::from_millis(10), "0".to_string()),
+            (Duration::from_millis(50), "40".to_string()),
+            (Duration::from_millis(100), r#"42["list:initialize"]"#.to_string()),
         ];
 
         for (delay, message) in handshake_sequence {
             time::sleep(delay).await;
-            ws_stream.send(Message::Text(message.to_string())).await.unwrap();
+            let mut write_lock = write.lock().await;
+            if let Err(e) = write_lock.send(Message::Text(message.clone())).await {
+                error!("❌ Ошибка отправки handshake: {}", e);
+                break;
+            }
             info!("📤 Отправляем: {}", message);
+        }
+    }
+
+    async fn start_ping_pong(&self, write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>) {
+        tokio::spawn(async move {
+            loop {
+                time::sleep(Duration::from_secs(25)).await;
+                let mut write_lock = write.lock().await;
+                if let Err(e) = write_lock.send(Message::Text("2".to_string())).await {
+                    error!("❌ Ошибка отправки ping: {}", e);
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn handle_websocket_messages(
+        mut read: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+        processed_orders: Arc<Mutex<HashSet<String>>>,
+        stats: Arc<Mutex<Stats>>,
+        config: Config,
+        client: Client,
+        is_running: Arc<Mutex<bool>>,
+    ) {
+        while *is_running.lock().await {
+            match read.next().await {
+                Some(Ok(message)) => {
+                    let start_time = Instant::now();
+                    Self::process_websocket_message(
+                        message,
+                        &write,
+                        &processed_orders,
+                        &stats,
+                        &config,
+                        &client,
+                        start_time,
+                    ).await;
+                }
+                Some(Err(e)) => {
+                    error!("❌ WebSocket ошибка: {}", e);
+                    break;
+                }
+                None => {
+                    warn!("📭 WebSocket поток закрыт");
+                    break;
+                }
+            }
         }
     }
 
     async fn process_websocket_message(
         message: Message,
+        write: &Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
         processed_orders: &Arc<Mutex<HashSet<String>>>,
         stats: &Arc<Mutex<Stats>>,
         config: &Config,
@@ -159,12 +213,21 @@ impl OptimizedP2POrderSnatcher {
             Message::Text(text) => {
                 // Ping-pong handling
                 if text == "2" {
-                    // Отправка pong
+                    let mut write_lock = write.lock().await;
+                    if let Err(e) = write_lock.send(Message::Text("3".to_string())).await {
+                        error!("❌ Ошибка отправки pong: {}", e);
+                    }
                     return;
                 }
-                if text == "3" || text.starts_with("40") {
+                
+                if text == "3" {
+                    return; // Pong ответ
+                }
+                
+                if text.starts_with("40") {
                     return;
                 }
+                
                 if text.starts_with('0') {
                     return;
                 }
@@ -182,8 +245,17 @@ impl OptimizedP2POrderSnatcher {
                 }
 
                 if text.starts_with("42") {
-                    info!("📨 Другое событие");
+                    info!("📨 Другое событие: {}", text);
                 }
+            }
+            Message::Ping(_) => {
+                let mut write_lock = write.lock().await;
+                if let Err(e) = write_lock.send(Message::Pong(vec![])).await {
+                    error!("❌ Ошибка отправки pong: {}", e);
+                }
+            }
+            Message::Close(_) => {
+                warn!("📭 Получен Close фрейм");
             }
             _ => {}
         }
@@ -224,8 +296,12 @@ impl OptimizedP2POrderSnatcher {
                 let order_json = &text[start..end];
                 if let Ok(order) = serde_json::from_str::<Order>(order_json) {
                     Self::handle_new_order(order, processed_orders, stats, config, client, start_time).await;
+                } else {
+                    error!("❌ Ошибка парсинга ордера: {}", order_json);
                 }
             }
+        } else {
+            warn!("⚠️ Не удалось найти данные ордера в сообщении");
         }
     }
 
@@ -259,6 +335,8 @@ impl OptimizedP2POrderSnatcher {
             let mut stats_lock = stats.lock().await;
             stats_lock.filtered += 1;
         }
+
+        info!("⚡ ЗАКАЗ {} {}", order.in_amount, order.in_asset);
 
         if config.take_orders {
             Self::take_order(&order.id, config, client, start_time, stats).await;
@@ -323,7 +401,7 @@ impl OptimizedP2POrderSnatcher {
                     if response_text.contains("ActiveOrderExists") {
                         info!("❌ Нужно оплатить старый заказ.");
                     } else {
-                        info!("❌ Не успели взять");
+                        info!("❌ Не успели взять, статус: {}", status);
                     }
                 }
             }
@@ -365,7 +443,9 @@ impl OptimizedP2POrderSnatcher {
 #[tokio::main]
 async fn main() {
     // Инициализация логгера
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
     
     // Загрузка переменных окружения
     dotenv().ok();
@@ -387,31 +467,37 @@ async fn main() {
             .unwrap_or(15000),
     };
 
-    // Вывод токена для проверки
-    println!("Access Token: {}", config.access_token);
+    // Вывод токена для проверки (только первые 10 символов)
+    let token_display = if config.access_token.len() > 10 {
+        format!("{}...", &config.access_token[..10])
+    } else {
+        config.access_token.clone()
+    };
+    println!("Access Token: {}", token_display);
 
     let bot = OptimizedP2POrderSnatcher::new(config);
 
     // Обработка сигналов завершения
-    let bot_clone = Arc::new(tokio::sync::Mutex::new(bot));
-    let bot_for_signal = bot_clone.clone();
+    let bot_for_signal = Arc::new(bot);
+    let bot_clone = bot_for_signal.clone();
     
     ctrlc::set_handler(move || {
         println!("\n🛑 Получен сигнал остановки...");
-        let bot = bot_for_signal.clone();
+        let bot = bot_clone.clone();
         tokio::spawn(async move {
-            bot.lock().await.stop().await;
+            bot.stop().await;
             process::exit(0);
         });
     }).expect("Ошибка установки обработчика сигнала");
 
+    // Запуск мониторинга статистики
+    bot_for_signal.start_monitoring().await;
+    
     // Запуск бота
-    let bot = bot_clone.lock().await;
-    bot.start_monitoring().await;
-    bot.start().await;
+    bot_for_signal.start().await;
 
     // Бесконечное ожидание
     loop {
-        time::sleep(Duration::from_secs(1)).await;
+        time::sleep(Duration::from_secs(60)).await;
     }
 }
