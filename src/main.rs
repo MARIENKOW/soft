@@ -416,7 +416,7 @@ async fn main() {
     dotenv().ok();
 
     let config = Config {
-        access_token: env::var("ACCESS_TOKEN").unwrap_or_else(|_| "500".to_string()),
+        access_token: env::var("ACCESS_TOKEN").unwrap_or_default("SPbUyWmYQArPG1e6JDq2XPKzE-jl-IY7hLs1C98St30ejoDJ5uYLGQ74WpMnEat5.C%2BOi8FLYjP8rZDkPVg2wwfezBxJaz%2FkY1r3FZ%2Fel0%2B0"),
         min_amount: env::var("MIN_AMOUNT")
             .unwrap_or_else(|_| "500".to_string())
             .parse()
