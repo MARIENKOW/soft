@@ -1,32 +1,55 @@
-use dotenvy::dotenv;
-use futures_util::{SinkExt, StreamExt};
-use reqwest::Client;
-use serde_json::Value;
-use std::{
-    collections::HashSet,
-    env,
-    sync::Arc,
-    time::Instant,
-};
+use std::collections::HashSet;
+use std::env;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tokio::net::TcpStream;
+use tokio::time;
+use tungstenite::protocol::Message;
+use url::Url;
+use serde::{Deserialize, Serialize};
+use dotenv::dotenv;
+use reqwest::Client;
+use std::process;
+use tokio_tungstenite::connect_async;
+use futures_util::{SinkExt, StreamExt};
+use log::{info, error, warn};
 
-type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
-type WsStreamSplit = futures_util::stream::SplitStream<WsStream>;
-
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Config {
     access_token: String,
-    min_amount: i64,
-    max_amount: i64,
+    min_amount: i32,
+    max_amount: i32,
     take_orders: bool,
-    timeout_ms: u64,
+    request_timeout: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize)]
+struct Order {
+    id: String,
+    in_amount: f64,
+    in_asset: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TakeOrderResponse {
+    data: Option<OrderData>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OrderData {
+    id: String,
+}
+
+struct OptimizedP2POrderSnatcher {
+    config: Config,
+    processed_orders: Arc<Mutex<HashSet<String>>>,
+    stats: Arc<Mutex<Stats>>,
+    client: Client,
+    is_running: Arc<Mutex<bool>>,
+}
+
+#[derive(Debug, Default)]
 struct Stats {
     total: u64,
     filtered: u64,
@@ -35,320 +58,360 @@ struct Stats {
     timeouts: u64,
 }
 
-struct Bot {
-    config: Config,
-    processed: Arc<Mutex<HashSet<String>>>,
-    stats: Arc<Mutex<Stats>>,
-    client: Client,
-}
-
-impl Bot {
+impl OptimizedP2POrderSnatcher {
     fn new(config: Config) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(config.request_timeout))
             .build()
-            .expect("Failed to build reqwest client");
+            .expect("Failed to create HTTP client");
 
         Self {
             config,
-            processed: Arc::new(Mutex::new(HashSet::new())),
+            processed_orders: Arc::new(Mutex::new(HashSet::new())),
             stats: Arc::new(Mutex::new(Stats::default())),
             client,
+            is_running: Arc::new(Mutex::new(true)),
         }
     }
 
-    async fn run(self: Arc<Self>) {
-        loop {
-            println!("🔌 Connecting to WebSocket...");
-            // URL
-            let url = "wss://app.cr.bot/internal/v1/p2c-socket/?EIO=4&transport=websocket";
+    async fn start(&self) {
+        info!("🚀 Запуск оптимизированного бота...");
+        info!("🎯 Мин сумма поиска → {}", self.config.min_amount);
+        info!("🎯 Макс сумма поиска → {}", self.config.max_amount);
 
-            // connect
-            let ws_res = connect_async(url).await;
-            let (ws_stream, _) = match ws_res {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("❌ WebSocket connect error: {}", e);
-                    sleep(Duration::from_secs(3)).await;
-                    continue;
+        self.connect_websocket().await;
+    }
+
+    async fn connect_websocket(&self) {
+        let ws_url = "wss://app.cr.bot/internal/v1/p2c-socket/?EIO=4&transport=websocket";
+        
+        info!("🔌 Подключаемся к WebSocket...");
+
+        let (mut ws_stream, _) = connect_async(Url::parse(ws_url).unwrap())
+            .await
+            .expect("Failed to connect");
+
+        // Установка заголовков через дополнительное соединение
+        info!("✅ WebSocket подключен");
+        self.send_socketio_handshake(&mut ws_stream).await;
+
+        let processed_orders_clone = self.processed_orders.clone();
+        let stats_clone = self.stats.clone();
+        let config_clone = self.config.clone();
+        let client_clone = self.client.clone();
+        let is_running_clone = self.is_running.clone();
+
+        // Обработка входящих сообщений
+        tokio::spawn(async move {
+            while *is_running_clone.lock().await {
+                match ws_stream.next().await {
+                    Some(Ok(message)) => {
+                        let start_time = Instant::now();
+                        Self::process_websocket_message(
+                            message,
+                            &processed_orders_clone,
+                            &stats_clone,
+                            &config_clone,
+                            &client_clone,
+                            start_time,
+                        ).await;
+                    }
+                    Some(Err(e)) => {
+                        error!("❌ WebSocket ошибка: {}", e);
+                        break;
+                    }
+                    None => break,
                 }
-            };
-
-            println!("✅ WS connected");
-
-            let (write_raw, mut read): (WsSink, WsStreamSplit) = ws_stream.split();
-
-            let write = Arc::new(Mutex::new(write_raw));
-
-            // send Socket.IO handshake sequence (spawned tasks so delays don't block)
-            {
-                let w = write.clone();
-                tokio::spawn(async move {
-                    let steps = vec![
-                        (10u64, "0"),
-                        (50u64, "40"),
-                        (100u64, r#"42["list:initialize"]"#),
-                    ];
-                    for (delay, msg) in steps {
-                        sleep(Duration::from_millis(delay)).await;
-                        let mut sink = w.lock().await;
-                        let _ = sink.send(Message::Text(msg.to_string())).await;
-                        // ignore result; reconnect logic will handle failures
-                    }
-                });
             }
+            
+            // Переподключение
+            warn!("🔌 WebSocket отключен, переподключаемся через 3 секунды...");
+            time::sleep(Duration::from_secs(3)).await;
+        });
+    }
 
-            // spawn a lightweight ping task (optional)
-            {
-                let w = write.clone();
-                tokio::spawn(async move {
-                    loop {
-                        sleep(Duration::from_secs(20)).await;
-                        let mut sink = w.lock().await;
-                        let _ = sink.send(Message::Text("3".to_string())).await; // pong? send as keepalive
-                    }
-                });
-            }
+    async fn send_socketio_handshake(&self, ws_stream: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        Message,
+    >) {
+        let handshake_sequence = vec![
+            (Duration::from_millis(10), "0"),
+            (Duration::from_millis(50), "40"),
+            (Duration::from_millis(100), r#"42["list:initialize"]"#),
+        ];
 
-            // read loop
-            while let Some(msg_res) = read.next().await {
-                let msg = match msg_res {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("WS read error: {}", e);
-                        break;
-                    }
-                };
+        for (delay, message) in handshake_sequence {
+            time::sleep(delay).await;
+            ws_stream.send(Message::Text(message.to_string())).await.unwrap();
+            info!("📤 Отправляем: {}", message);
+        }
+    }
 
-                // only care about text messages
-                let text = match msg {
-                    Message::Text(t) => t,
-                    Message::Binary(_) => continue,
-                    Message::Ping(_) => continue,
-                    Message::Pong(_) => continue,
-                    Message::Close(_) => {
-                        println!("WS closed by server");
-                        break;
-                    }
-                };
-
-                // handle socket.io heartbeats and prefixes
+    async fn process_websocket_message(
+        message: Message,
+        processed_orders: &Arc<Mutex<HashSet<String>>>,
+        stats: &Arc<Mutex<Stats>>,
+        config: &Config,
+        client: &Client,
+        start_time: Instant,
+    ) {
+        match message {
+            Message::Text(text) => {
+                // Ping-pong handling
                 if text == "2" {
-                    // server ping -> send pong "3"
-                    let mut sink = write.lock().await;
-                    let _ = sink.send(Message::Text("3".to_string())).await;
-                    continue;
+                    // Отправка pong
+                    return;
                 }
-                if text == "3" { continue; }
-                if text.starts_with("40") { continue; }
-                if text.starts_with("0") {
-                    // sometimes contains handshake info; ignore
-                    continue;
+                if text == "3" || text.starts_with("40") {
+                    return;
+                }
+                if text.starts_with('0') {
+                    return;
                 }
 
-                if text.starts_with(r#"42["list:snapshot""#) {
-                    println!("✅ SNAPSHOT received, waiting orders...");
-                    continue;
+                // List snapshot
+                if text.contains("list:snapshot") {
+                    info!("✅ ВСЁ ПОДКЛЮЧЕНО УСПЕШНО → ОЖИДАЕМ ЗАКАЗЫ ✅ ");
+                    info!("----------------------------------------------");
+                    return;
                 }
 
-                if text.starts_with(r#"42["list:update""#) {
-                    let me = self.clone();
-                    // handle update in background to not block read loop
-                    tokio::spawn(async move {
-                        me.handle_list_update(&text).await;
-                    });
-                    continue;
+                if text.contains("list:update") {
+                    Self::handle_list_update(text, processed_orders, stats, config, client, start_time).await;
+                    return;
                 }
 
-                // other 42 events
                 if text.starts_with("42") {
-                    // optional: parse general events
-                    if let Ok(payload) = serde_json::from_str::<Value>(&text[2..]) {
-                        println!("📨 Other event: {}", payload);
-                    }
+                    info!("📨 Другое событие");
                 }
             }
-
-            println!("🔌 WS disconnected, reconnect in 3s...");
-            sleep(Duration::from_secs(3)).await;
+            _ => {}
         }
     }
 
-    async fn handle_list_update(self: Arc<Self>, text: &str) {
-        // increment total
-        {
-            let mut s = self.stats.lock().await;
-            s.total += 1;
-        }
-
-        // fast search for "data":{...}
-        let data_pos = match text.find("\"data\":") {
-            Some(p) => p + 7,
-            None => return,
-        };
-
-        // find first '{' after data_pos
-        let slice = &text[data_pos..];
-        let start_rel = match slice.find('{') {
-            Some(i) => i,
-            None => return,
-        };
-        let mut bracket = 0isize;
-        let mut end_rel = None;
-        for (i, ch) in slice[start_rel..].char_indices() {
-            match ch {
-                '{' => bracket += 1,
-                '}' => {
-                    bracket -= 1;
-                    if bracket == 0 {
-                        end_rel = Some(start_rel + i + 1);
+    async fn handle_list_update(
+        text: String,
+        processed_orders: &Arc<Mutex<HashSet<String>>>,
+        stats: &Arc<Mutex<Stats>>,
+        config: &Config,
+        client: &Client,
+        start_time: Instant,
+    ) {
+        // Быстрый парсинг данных
+        if let Some(data_start) = text.find("\"data\":") {
+            let mut bracket_count = 0;
+            let mut data_start_index = None;
+            let mut data_end_index = None;
+            
+            let chars: Vec<char> = text.chars().collect();
+            
+            for i in data_start + 7..chars.len() {
+                if chars[i] == '{' && data_start_index.is_none() {
+                    data_start_index = Some(i);
+                    bracket_count = 1;
+                } else if chars[i] == '{' {
+                    bracket_count += 1;
+                } else if chars[i] == '}' {
+                    bracket_count -= 1;
+                    if bracket_count == 0 {
+                        data_end_index = Some(i + 1);
                         break;
                     }
                 }
-                _ => {}
+            }
+            
+            if let (Some(start), Some(end)) = (data_start_index, data_end_index) {
+                let order_json = &text[start..end];
+                if let Ok(order) = serde_json::from_str::<Order>(order_json) {
+                    Self::handle_new_order(order, processed_orders, stats, config, client, start_time).await;
+                }
             }
         }
-        let end_rel = match end_rel {
-            Some(v) => v,
-            None => return,
-        };
+    }
 
-        let json_str = &slice[start_rel..end_rel];
+    async fn handle_new_order(
+        order: Order,
+        processed_orders: &Arc<Mutex<HashSet<String>>>,
+        stats: &Arc<Mutex<Stats>>,
+        config: &Config,
+        client: &Client,
+        start_time: Instant,
+    ) {
+        let mut stats_lock = stats.lock().await;
+        stats_lock.total += 1;
+        drop(stats_lock);
 
-        let order: Value = match serde_json::from_str(json_str) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-
-        let id = match order.get("id").and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => return,
-        };
-
-        // dedupe
+        // Проверка дубликатов
         {
-            let mut processed = self.processed.lock().await;
-            if processed.contains(&id) {
+            let mut processed = processed_orders.lock().await;
+            if processed.contains(&order.id) {
                 return;
             }
-            processed.insert(id.clone());
+            processed.insert(order.id.clone());
         }
 
-        // validate
-        let amount = order.get("in_amount").and_then(|v| v.as_f64()).unwrap_or(0.0).trunc() as i64;
-        let asset = order.get("in_asset").and_then(|v| v.as_str()).unwrap_or("");
-
-        if amount < self.config.min_amount || amount > self.config.max_amount || asset != "RUB" {
+        // Валидация
+        if !Self::is_valid_order(&order, config) {
             return;
         }
 
         {
-            let mut s = self.stats.lock().await;
-            s.filtered += 1;
+            let mut stats_lock = stats.lock().await;
+            stats_lock.filtered += 1;
         }
 
-        if self.config.take_orders {
-            let me = self.clone();
-            tokio::spawn(async move {
-                let ok = me.take_order(&id).await;
-                if ok {
-                    // taken increment done inside take_order
-                }
-            });
+        if config.take_orders {
+            Self::take_order(&order.id, config, client, start_time, stats).await;
         }
     }
 
-    async fn take_order(self: Arc<Self>, id: &str) -> bool {
-        let url = format!("https://app.cr.bot/internal/v1/p2c/payments/take/{}", id);
-        let cookie = format!("access_token={}", self.config.access_token);
-        let start = Instant::now();
+    fn is_valid_order(order: &Order, config: &Config) -> bool {
+        let amount = order.in_amount as i32;
+        
+        if amount < config.min_amount || 
+           order.in_asset != "RUB" || 
+           amount > config.max_amount {
+            return false;
+        }
+        
+        true
+    }
 
-        let req = self.client.post(&url)
-            .header("Cookie", cookie)
+    async fn take_order(
+        order_id: &str,
+        config: &Config,
+        client: &Client,
+        start_time: Instant,
+        stats: &Arc<Mutex<Stats>>,
+    ) {
+        let url = format!("https://app.cr.bot/internal/v1/p2c/payments/take/{}", order_id);
+        
+        let response = client.post(&url)
+            .header("Cookie", format!("access_token={}", config.access_token))
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .header("Origin", "https://app.cr.bot")
             .header("Referer", "https://app.cr.bot/p2c")
-            .header("User-Agent", "Mozilla/5.0 (compatible)");
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Content-Type", "application/json")
+            .send()
+            .await;
 
-        // use tokio timeout wrapper around the send
-        match timeout(Duration::from_millis(self.config.timeout_ms), req.send()).await {
-            Err(_) => {
-                let mut s = self.stats.lock().await;
-                s.timeouts += 1;
-                println!("⏰ TAKE timeout for id {}", id);
-                return false;
-            }
-            Ok(Err(e)) => {
-                let mut s = self.stats.lock().await;
-                s.failed += 1;
-                eprintln!("❌ TAKE request error: {}", e);
-                return false;
-            }
-            Ok(Ok(resp)) => {
-                let elapsed = start.elapsed().as_millis();
-                println!("⚡ RTT {} ms for id {}", elapsed, id);
+        let elapsed = start_time.elapsed();
+        info!("Время обработки: {} мс", elapsed.as_millis());
 
-                if resp.status().as_u16() == 200 {
-                    let mut s = self.stats.lock().await;
-                    s.taken += 1;
-                    println!("✅ ORDER TAKEN {}", id);
-                    // optionally print link if response contains data
-                    if let Ok(json) = resp.json::<Value>().await {
-                        if let Some(order_data) = json.get("data") {
-                            if let Some(order_id) = order_data.get("id").and_then(|v| v.as_str()) {
-                                println!("Payment link -> https://app.cr.bot/p2c/orders/{}?back=payments", order_id);
-                            }
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                let response_text = resp.text().await.unwrap_or_default();
+                
+                if status == 200 {
+                    let mut stats_lock = stats.lock().await;
+                    stats_lock.taken += 1;
+                    info!("✅ ЗАКАЗ ВЗЯТ УСПЕШНО!");
+
+                    if let Ok(parsed) = serde_json::from_str::<TakeOrderResponse>(&response_text) {
+                        if let Some(order_data) = parsed.data {
+                            let payment_link = format!("https://app.cr.bot/p2c/orders/{}?back=payments", order_data.id);
+                            info!("Ссылка для оплаты - {}", payment_link);
                         }
                     }
-                    return true;
                 } else {
-                    let mut s = self.stats.lock().await;
-                    s.failed += 1;
-                    // try to parse error
-                    if let Ok(j) = resp.json::<Value>().await {
-                        if j.get("error").and_then(|v| v.as_str()) == Some("ActiveOrderExists") {
-                            println!("❌ ActiveOrderExists - need to pay old order");
-                        } else {
-                            println!("❌ Not taken: status {}", resp.status());
-                        }
+                    let mut stats_lock = stats.lock().await;
+                    stats_lock.failed += 1;
+                    
+                    if response_text.contains("ActiveOrderExists") {
+                        info!("❌ Нужно оплатить старый заказ.");
                     } else {
-                        println!("❌ Not taken: status {}", resp.status());
+                        info!("❌ Не успели взять");
                     }
                 }
             }
+            Err(e) => {
+                let mut stats_lock = stats.lock().await;
+                if e.is_timeout() {
+                    stats_lock.timeouts += 1;
+                    info!("⏰ Таймаут...");
+                } else {
+                    stats_lock.failed += 1;
+                    error!("❌ Ошибка: {}", e);
+                }
+            }
         }
+    }
 
-        false
+    async fn start_monitoring(&self) {
+        let stats_clone = self.stats.clone();
+        
+        tokio::spawn(async move {
+            loop {
+                time::sleep(Duration::from_secs(15)).await;
+                let stats = stats_clone.lock().await;
+                info!(
+                    "📈 СТАТИСТИКА: Всего {}, Подходят {}, Взято {}, Не взяли {}",
+                    stats.total, stats.filtered, stats.taken, stats.failed
+                );
+            }
+        });
+    }
+
+    async fn stop(&self) {
+        let mut is_running = self.is_running.lock().await;
+        *is_running = false;
+        info!("🛑 Бот остановлен");
     }
 }
 
 #[tokio::main]
 async fn main() {
+    // Инициализация логгера
+    env_logger::init();
+    
+    // Загрузка переменных окружения
     dotenv().ok();
-    let cfg = Config {
+
+    let config = Config {
         access_token: env::var("ACCESS_TOKEN").unwrap_or_default(),
-        min_amount: env::var("MIN_AMOUNT").unwrap_or("500".into()).parse().unwrap_or(500),
-        max_amount: env::var("MAX_AMOUNT").unwrap_or("7500".into()).parse().unwrap_or(7500),
-        take_orders: env::var("TAKE_ORDERS").unwrap_or("true".into()) == "true",
-        timeout_ms: env::var("REQUEST_TIMEOUT").unwrap_or("15000".into()).parse().unwrap_or(15000),
+        min_amount: env::var("MIN_AMOUNT")
+            .unwrap_or_else(|_| "500".to_string())
+            .parse()
+            .unwrap_or(500),
+        max_amount: env::var("MAX_AMOUNT")
+            .unwrap_or_else(|_| "7500".to_string())
+            .parse()
+            .unwrap_or(7500),
+        take_orders: true,
+        request_timeout: env::var("REQUEST_TIMEOUT")
+            .unwrap_or_else(|_| "15000".to_string())
+            .parse()
+            .unwrap_or(15000),
     };
 
-    println!("ACCESS_TOKEN prefix: {}", &cfg.access_token.chars().take(8).collect::<String>());
+    // Вывод токена для проверки
+    println!("Access Token: {}", config.access_token);
 
-    let bot = Arc::new(Bot::new(cfg.clone()));
+    let bot = OptimizedP2POrderSnatcher::new(config);
 
-    // stats printer
-    {
-        let stats = bot.stats.clone();
+    // Обработка сигналов завершения
+    let bot_clone = Arc::new(tokio::sync::Mutex::new(bot));
+    let bot_for_signal = bot_clone.clone();
+    
+    ctrlc::set_handler(move || {
+        println!("\n🛑 Получен сигнал остановки...");
+        let bot = bot_for_signal.clone();
         tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(15)).await;
-                let s = stats.lock().await;
-                println!("📈 STATS: total={}, filtered={}, taken={}, failed={}, timeouts={}",
-                    s.total, s.filtered, s.taken, s.failed, s.timeouts);
-            }
+            bot.lock().await.stop().await;
+            process::exit(0);
         });
-    }
+    }).expect("Ошибка установки обработчика сигнала");
 
-    // run main loop
-    bot.run().await;
+    // Запуск бота
+    let bot = bot_clone.lock().await;
+    bot.start_monitoring().await;
+    bot.start().await;
+
+    // Бесконечное ожидание
+    loop {
+        time::sleep(Duration::from_secs(1)).await;
+    }
 }
