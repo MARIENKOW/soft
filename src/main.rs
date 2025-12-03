@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use dotenv::dotenv;
 use reqwest::Client;
 use std::process;
-use tokio_tungstenite::{connect_async, WebSocketStream};
+use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 use futures_util::{SinkExt, StreamExt};
 use log::{info, error, warn};
 use futures_util::stream::SplitSink;
@@ -112,7 +112,22 @@ impl OptimizedP2POrderSnatcher {
         
         info!("🔌 Подключаемся к WebSocket...");
 
-        let (ws_stream, _) = connect_async(Url::parse(ws_url).unwrap()).await?;
+        // Создаем запрос с заголовками
+        let mut request = Url::parse(ws_url)?.into_client_request()?;
+        request.headers_mut().insert(
+            "Cookie",
+            format!("access_token={}", self.config.access_token).parse()?,
+        );
+        request.headers_mut().insert(
+            "Origin",
+            "https://app.cr.bot".parse()?,
+        );
+        request.headers_mut().insert(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse()?,
+        );
+
+        let (ws_stream, _) = connect_async(request).await?;
         info!("✅ WebSocket подключен");
         
         let (write, read) = ws_stream.split();
