@@ -4,17 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time;
-use tungstenite::protocol::Message;
-use url::Url;
 use serde::{Deserialize, Serialize};
 use dotenv::dotenv;
 use reqwest::Client;
 use std::process;
-use tokio_tungstenite::{connect_async, WebSocketStream, MaybeTlsStream};
-use tokio::net::TcpStream;
-use futures_util::{SinkExt, StreamExt};
 use log::{info, error, warn};
-use futures_util::stream::SplitSink;
+use futures_util::{StreamExt, SinkExt};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::handshake::client::Request;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -86,15 +83,20 @@ impl OptimizedP2POrderSnatcher {
 
     async fn connect_websocket_with_retry(&self) {
         loop {
-            if let Err(e) = self.try_connect_websocket().await {
-                error!("❌ Ошибка подключения WebSocket: {}", e);
-                warn!("🔌 Переподключаемся через 3 секунды...");
-                time::sleep(Duration::from_secs(3)).await;
-            } else {
-                info!("✅ WebSocket соединение установлено и работает");
-                time::sleep(Duration::from_secs(1)).await;
+            match self.try_connect_websocket().await {
+                Ok(_) => {
+                    info!("✅ WebSocket соединение установлено и работает");
+                    // Ждем пока соединение не разорвется
+                    time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    error!("❌ Ошибка подключения WebSocket: {}", e);
+                    warn!("🔌 Переподключаемся через 3 секунды...");
+                    time::sleep(Duration::from_secs(3)).await;
+                }
             }
             
+            // Проверяем не остановлен ли бот
             if !*self.is_running.lock().await {
                 break;
             }
@@ -106,25 +108,37 @@ impl OptimizedP2POrderSnatcher {
         
         info!("🔌 Подключаемся к WebSocket...");
 
-        // Простое подключение без заголовков (они не нужны для начального подключения)
-        let (ws_stream, _) = connect_async(ws_url).await?;
+        // Создаем запрос с заголовками
+        let mut request = Request::new(ws_url.parse()?);
+        request.headers_mut().insert(
+            "Cookie",
+            format!("access_token={}", self.config.access_token).parse()?
+        );
+        request.headers_mut().insert(
+            "Origin",
+            "https://app.cr.bot".parse()?
+        );
+        request.headers_mut().insert(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse()?
+        );
+
+        let (ws_stream, _) = connect_async(request).await?;
         info!("✅ WebSocket подключен");
         
-        let (write, mut read) = ws_stream.split();
-        
-        let write_arc = Arc::new(Mutex::new(write));
+        let (mut write, mut read) = ws_stream.split();
         
         // Отправка handshake
-        self.send_socketio_handshake(write_arc.clone()).await?;
+        self.send_socketio_handshake(&mut write).await?;
 
-        // Клонируем данные
+        // Клонируем необходимые данные для обработчика сообщений
         let processed_orders_clone = self.processed_orders.clone();
         let stats_clone = self.stats.clone();
         let config_clone = self.config.clone();
         let client_clone = self.client.clone();
         let is_running_clone = self.is_running.clone();
 
-        // Обработчик сообщений
+        // Запускаем обработчик входящих сообщений
         tokio::spawn(async move {
             while *is_running_clone.lock().await {
                 match read.next().await {
@@ -155,8 +169,8 @@ impl OptimizedP2POrderSnatcher {
     }
 
     async fn send_socketio_handshake(
-        &self, 
-        write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>
+        &self,
+        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let handshake_sequence = vec![
             (Duration::from_millis(10), "0".to_string()),
@@ -166,8 +180,7 @@ impl OptimizedP2POrderSnatcher {
 
         for (delay, message) in handshake_sequence {
             time::sleep(delay).await;
-            let mut write_lock = write.lock().await;
-            write_lock.send(Message::Text(message.clone())).await?;
+            write.send(Message::Text(message.clone())).await?;
             info!("📤 Отправляем: {}", message);
         }
         
@@ -417,15 +430,19 @@ async fn main() {
 
     let config = Config {
         access_token: env::var("ACCESS_TOKEN").unwrap_or("SPbUyWmYQArPG1e6JDq2XPKzE-jl-IY7hLs1C98St30ejoDJ5uYLGQ74WpMnEat5.C%2BOi8FLYjP8rZDkPVg2wwfezBxJaz%2FkY1r3FZ%2Fel0%2B0".to_string()),
+        
         min_amount: env::var("MIN_AMOUNT")
             .unwrap_or_else(|_| "500".to_string())
             .parse()
             .unwrap_or(500),
+        
         max_amount: env::var("MAX_AMOUNT")
             .unwrap_or_else(|_| "7500".to_string())
             .parse()
             .unwrap_or(7500),
+        
         take_orders: true,
+        
         request_timeout: env::var("REQUEST_TIMEOUT")
             .unwrap_or_else(|_| "15000".to_string())
             .parse()
