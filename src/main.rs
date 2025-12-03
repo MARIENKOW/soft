@@ -10,8 +10,7 @@ use reqwest::Client;
 use std::process;
 use log::{info, error, warn};
 use futures_util::{StreamExt, SinkExt};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, tungstenite::client::IntoClientRequest};
-use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -108,22 +107,9 @@ impl OptimizedP2POrderSnatcher {
         
         info!("🔌 Подключаемся к WebSocket...");
 
-        // Создаем запрос с заголовками
-        let mut request = Request::new(ws_url.parse()?);
-        request.headers_mut().insert(
-            "Cookie",
-            format!("access_token={}", self.config.access_token).parse()?
-        );
-        request.headers_mut().insert(
-            "Origin",
-            "https://app.cr.bot".parse()?
-        );
-        request.headers_mut().insert(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse()?
-        );
-
-        let (ws_stream, _) = connect_async(request).await?;
+        // Простое подключение без кастомных заголовков
+        let url = url::Url::parse(ws_url)?;
+        let (ws_stream, _) = connect_async(url).await?;
         info!("✅ WebSocket подключен");
         
         let (mut write, mut read) = ws_stream.split();
@@ -170,7 +156,10 @@ impl OptimizedP2POrderSnatcher {
 
     async fn send_socketio_handshake(
         &self,
-        write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Message>
+        write: &mut futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Message
+        >
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let handshake_sequence = vec![
             (Duration::from_millis(10), "0".to_string()),
