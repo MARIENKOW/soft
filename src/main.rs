@@ -112,22 +112,12 @@ impl OptimizedP2POrderSnatcher {
         
         info!("🔌 Подключаемся к WebSocket...");
 
-        // Создаем запрос с заголовками
-        let mut request = Url::parse(ws_url)?.into_client_request()?;
-        request.headers_mut().insert(
-            "Cookie",
-            format!("access_token={}", self.config.access_token).parse()?,
-        );
-        request.headers_mut().insert(
-            "Origin",
-            "https://app.cr.bot".parse()?,
-        );
-        request.headers_mut().insert(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse()?,
-        );
-
-        let (ws_stream, _) = connect_async(request).await?;
+        let url = Url::parse(ws_url)?;
+        let host = url.host_str().unwrap_or("app.cr.bot");
+        let port = url.port().unwrap_or(443);
+        
+        // Простой способ подключения - без кастомных заголовков
+        let (ws_stream, _) = connect_async(ws_url).await?;
         info!("✅ WebSocket подключен");
         
         let (write, read) = ws_stream.split();
