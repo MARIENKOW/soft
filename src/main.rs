@@ -4,13 +4,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time;
+use tungstenite::protocol::Message;
+use url::Url;
 use serde::{Deserialize, Serialize};
 use dotenv::dotenv;
 use reqwest::Client;
 use std::process;
+use tokio_tungstenite::{connect_async, WebSocketStream, MaybeTlsStream};
+use tokio::net::TcpStream;
+use futures_util::{SinkExt, StreamExt};
 use log::{info, error, warn};
-use websocket::{ClientBuilder, Message, OwnedMessage};
-use websocket::header::Headers;
+use futures_util::stream::SplitSink;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -82,20 +86,15 @@ impl OptimizedP2POrderSnatcher {
 
     async fn connect_websocket_with_retry(&self) {
         loop {
-            match self.try_connect_websocket().await {
-                Ok(_) => {
-                    info!("✅ WebSocket соединение установлено и работает");
-                    // Ждем пока соединение не разорвется
-                    time::sleep(Duration::from_secs(1)).await;
-                }
-                Err(e) => {
-                    error!("❌ Ошибка подключения WebSocket: {}", e);
-                    warn!("🔌 Переподключаемся через 3 секунды...");
-                    time::sleep(Duration::from_secs(3)).await;
-                }
+            if let Err(e) = self.try_connect_websocket().await {
+                error!("❌ Ошибка подключения WebSocket: {}", e);
+                warn!("🔌 Переподключаемся через 3 секунды...");
+                time::sleep(Duration::from_secs(3)).await;
+            } else {
+                info!("✅ WebSocket соединение установлено и работает");
+                time::sleep(Duration::from_secs(1)).await;
             }
             
-            // Проверяем не остановлен ли бот
             if !*self.is_running.lock().await {
                 break;
             }
@@ -107,35 +106,29 @@ impl OptimizedP2POrderSnatcher {
         
         info!("🔌 Подключаемся к WebSocket...");
 
-        let mut headers = Headers::new();
-        headers.set_raw("Cookie", format!("access_token={}", self.config.access_token));
-        headers.set_raw("Origin", "https://app.cr.bot");
-
-        // Используем синхронный клиент websocket
-        let client = ClientBuilder::new(ws_url)?
-            .custom_headers(&headers)
-            .async_connect(None, None)
-            .await?;
-
+        // Простое подключение без заголовков (они не нужны для начального подключения)
+        let (ws_stream, _) = connect_async(ws_url).await?;
         info!("✅ WebSocket подключен");
-
-        let (mut receiver, mut sender) = client.split()?;
-
+        
+        let (write, mut read) = ws_stream.split();
+        
+        let write_arc = Arc::new(Mutex::new(write));
+        
         // Отправка handshake
-        self.send_socketio_handshake(&mut sender).await?;
+        self.send_socketio_handshake(write_arc.clone()).await?;
 
-        // Клонируем необходимые данные для обработчика сообщений
+        // Клонируем данные
         let processed_orders_clone = self.processed_orders.clone();
         let stats_clone = self.stats.clone();
         let config_clone = self.config.clone();
         let client_clone = self.client.clone();
         let is_running_clone = self.is_running.clone();
 
-        // Запускаем обработчик входящих сообщений
+        // Обработчик сообщений
         tokio::spawn(async move {
             while *is_running_clone.lock().await {
-                match receiver.recv_message().await {
-                    Ok(message) => {
+                match read.next().await {
+                    Some(Ok(message)) => {
                         let start_time = Instant::now();
                         Self::process_websocket_message(
                             message,
@@ -146,8 +139,12 @@ impl OptimizedP2POrderSnatcher {
                             start_time,
                         ).await;
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         error!("❌ WebSocket ошибка: {}", e);
+                        break;
+                    }
+                    None => {
+                        warn!("📭 WebSocket поток закрыт");
                         break;
                     }
                 }
@@ -158,8 +155,8 @@ impl OptimizedP2POrderSnatcher {
     }
 
     async fn send_socketio_handshake(
-        &self,
-        sender: &mut websocket::client::async::Writer<websocket::stream::async::Stream>
+        &self, 
+        write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let handshake_sequence = vec![
             (Duration::from_millis(10), "0".to_string()),
@@ -169,7 +166,8 @@ impl OptimizedP2POrderSnatcher {
 
         for (delay, message) in handshake_sequence {
             time::sleep(delay).await;
-            sender.send_message(&Message::text(message.clone())).await?;
+            let mut write_lock = write.lock().await;
+            write_lock.send(Message::Text(message.clone())).await?;
             info!("📤 Отправляем: {}", message);
         }
         
@@ -177,7 +175,7 @@ impl OptimizedP2POrderSnatcher {
     }
 
     async fn process_websocket_message(
-        message: OwnedMessage,
+        message: Message,
         processed_orders: &Arc<Mutex<HashSet<String>>>,
         stats: &Arc<Mutex<Stats>>,
         config: &Config,
@@ -185,15 +183,15 @@ impl OptimizedP2POrderSnatcher {
         start_time: Instant,
     ) {
         match message {
-            OwnedMessage::Text(text) => {
+            Message::Text(text) => {
                 // Ping-pong handling
                 if text == "2" {
-                    // Автоматически обрабатывается библиотекой
+                    // Автоматически обрабатывается
                     return;
                 }
                 
                 if text == "3" {
-                    return; // Pong ответ
+                    return;
                 }
                 
                 if text.starts_with("40") {
@@ -204,7 +202,6 @@ impl OptimizedP2POrderSnatcher {
                     return;
                 }
 
-                // List snapshot
                 if text.contains("list:snapshot") {
                     info!("✅ ВСЁ ПОДКЛЮЧЕНО УСПЕШНО → ОЖИДАЕМ ЗАКАЗЫ ✅ ");
                     info!("----------------------------------------------");
@@ -215,15 +212,11 @@ impl OptimizedP2POrderSnatcher {
                     Self::handle_list_update(text, processed_orders, stats, config, client, start_time).await;
                     return;
                 }
-
-                if text.starts_with("42") {
-                    // info!("📨 Другое событие: {}", text);
-                }
             }
-            OwnedMessage::Ping(_) => {
-                // Автоматически отвечает библиотека
+            Message::Ping(_) => {
+                // Автоматически отвечает
             }
-            OwnedMessage::Close(_) => {
+            Message::Close(_) => {
                 warn!("📭 Получен Close фрейм");
             }
             _ => {}
@@ -238,7 +231,6 @@ impl OptimizedP2POrderSnatcher {
         client: &Client,
         start_time: Instant,
     ) {
-        // Быстрый парсинг данных
         if let Some(data_start) = text.find("\"data\":") {
             let mut bracket_count = 0;
             let mut data_start_index = None;
@@ -265,12 +257,8 @@ impl OptimizedP2POrderSnatcher {
                 let order_json = &text[start..end];
                 if let Ok(order) = serde_json::from_str::<Order>(order_json) {
                     Self::handle_new_order(order, processed_orders, stats, config, client, start_time).await;
-                } else {
-                    error!("❌ Ошибка парсинга ордера: {}", order_json);
                 }
             }
-        } else {
-            warn!("⚠️ Не удалось найти данные ордера в сообщении");
         }
     }
 
@@ -286,7 +274,6 @@ impl OptimizedP2POrderSnatcher {
         stats_lock.total += 1;
         drop(stats_lock);
 
-        // Проверка дубликатов
         {
             let mut processed = processed_orders.lock().await;
             if processed.contains(&order.id) {
@@ -295,7 +282,6 @@ impl OptimizedP2POrderSnatcher {
             processed.insert(order.id.clone());
         }
 
-        // Валидация
         if !Self::is_valid_order(&order, config) {
             return;
         }
@@ -423,12 +409,10 @@ impl Clone for OptimizedP2POrderSnatcher {
 
 #[tokio::main]
 async fn main() {
-    // Инициализация логгера
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .init();
     
-    // Загрузка переменных окружения
     dotenv().ok();
 
     let config = Config {
@@ -456,7 +440,6 @@ async fn main() {
     info!("Access Token: {}", token_display);
 
     let bot = OptimizedP2POrderSnatcher::new(config);
-
     let bot_for_signal = Arc::new(bot);
     let bot_clone = bot_for_signal.clone();
     
