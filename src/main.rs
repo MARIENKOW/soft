@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use dotenv::dotenv;
 use reqwest::Client;
 use std::process;
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest, WebSocketStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{info, error, warn};
 use futures_util::stream::SplitSink;
